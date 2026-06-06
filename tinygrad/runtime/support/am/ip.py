@@ -95,15 +95,15 @@ class AM_GMC(AM_IP):
     if not self.hub_initted[ip]: return
 
     for inst in range(self.adev.gmc.vmhubs if ip == "MM" else self.adev.gfx.xccs):
-      if ip == "MM": wait_cond(lambda: self.adev.regMMVM_INVALIDATE_ENG17_SEM.read(inst=inst) & 0x1, value=1, msg="mm flush_tlb timeout")
+      if ip == "MM" and not self.adev.is_vf: wait_cond(lambda: self.adev.regMMVM_INVALIDATE_ENG17_SEM.read(inst=inst) & 0x1, value=1, msg="mm flush_tlb timeout")
 
       self.adev.reg(f"reg{ip}VM_INVALIDATE_ENG17_REQ").write(flush_type=flush_type, per_vmid_invalidate_req=(1 << vmid), invalidate_l2_ptes=1,
         invalidate_l2_pde0=1, invalidate_l2_pde1=1, invalidate_l2_pde2=1, invalidate_l1_ptes=1, clear_protection_fault_status_addr=0, inst=inst)
 
       wait_cond(lambda: self.adev.reg(f"reg{ip}VM_INVALIDATE_ENG17_ACK").read(inst=inst) & (1 << vmid), value=(1 << vmid), msg="flush_tlb timeout")
 
-      if ip == "MM": self.adev.regMMVM_INVALIDATE_ENG17_SEM.write(0x0, inst=inst)
-      if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0) and ip == "MM":
+      if ip == "MM" and not self.adev.is_vf: self.adev.regMMVM_INVALIDATE_ENG17_SEM.write(0x0, inst=inst)
+      if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0) and ip == "MM" and not self.adev.is_vf:
         self.adev.regMMVM_L2_BANK_SELECT_RESERVED_CID2.update(reserved_cache_private_invalidation=1, inst=inst)
 
         # Read back the register to ensure the invalidation is complete
