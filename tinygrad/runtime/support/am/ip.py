@@ -508,7 +508,9 @@ class AM_IH(AM_IP):
         print(f"am {self.adev.devfmt}: GCVM_L2_PROTECTION_FAULT_STATUS: {bf} {va<<12:#x}")
         self.adev.reg('regGCVM_L2_PROTECTION_FAULT_CNTL').update(clear_protection_fault_status_addr=1)
         self.adev.is_err_state = True
-      else: self.adev.is_err_state = True
+      else:
+        if AM_DEBUG >= 1:
+          print(f"am {self.adev.devfmt}: unhandled IH event: client={client} src={src} src_name={src_name}")
 
     self.drain()
 
