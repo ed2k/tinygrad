@@ -444,6 +444,7 @@ class AM_IH(AM_IP):
     self.ring_view = self.adev.vram.view(offset=self.rings[0][0], size=self.ring_size, fmt='I')
 
   def init_hw(self):
+    if self.adev.is_vf: return
     for ring_vm, rwptr_vm, suf, ring_id in self.rings:
       self.adev.wreg_pair("regIH_RB_BASE", suf, f"_HI{suf}", self.adev.paddr2mc(ring_vm) >> 8)
 
@@ -477,6 +478,7 @@ class AM_IH(AM_IP):
       self.adev.reg(f"regIH_RB_CNTL{suf}").update(wptr_overflow_clear=0)
 
   def interrupt_handler(self):
+    if self.adev.is_vf: return
     _, _, suf, _ = self.rings[0]
     wptr = self.adev.reg(f"regIH_RB_WPTR{suf}").read_bitfields()
     rptr = self.adev.regIH_RB_RPTR.read()
