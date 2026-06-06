@@ -21,7 +21,16 @@ if __name__ == "__main__":
   noiommu_param = "/sys/module/vfio/parameters/enable_unsafe_noiommu_mode"
   if os.path.exists(noiommu_param):
     with open(noiommu_param, "r") as f:
-      print(f"VFIO unsafe no-iommu mode parameter: {f.read().strip()}")
+      val = f.read().strip()
+      print(f"VFIO unsafe no-iommu mode parameter: {val}")
+    if val in {'N', '0'}:
+      print("Enabling VFIO unsafe no-iommu mode...")
+      try:
+        with open(noiommu_param, "w") as f:
+          f.write("1")
+        print("VFIO unsafe no-iommu mode enabled successfully.")
+      except Exception as e:
+        print(f"Failed to enable VFIO unsafe no-iommu mode: {e}. Try running with sudo.")
   else:
     print("VFIO unsafe no-iommu mode parameter does not exist.")
 
