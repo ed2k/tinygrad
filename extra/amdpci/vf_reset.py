@@ -1,10 +1,30 @@
 #!/usr/bin/env python3
 import os
 import time
+import subprocess
 from tinygrad.runtime.support.system import System
 from tinygrad.runtime.support.hcq import FileIOInterface
 
+def run_cmd(cmd):
+  print(f"[CMD] {cmd}")
+  try:
+    res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if res.stdout: print(f"STDOUT:\n{res.stdout.strip()}")
+    if res.stderr: print(f"STDERR:\n{res.stderr.strip()}")
+    return res.returncode
+  except Exception as e:
+    print(f"Failed to run cmd: {e}")
+    return -1
+
 if __name__ == "__main__":
+  # Check no-iommu parameter
+  noiommu_param = "/sys/module/vfio/parameters/enable_unsafe_noiommu_mode"
+  if os.path.exists(noiommu_param):
+    with open(noiommu_param, "r") as f:
+      print(f"VFIO unsafe no-iommu mode parameter: {f.read().strip()}")
+  else:
+    print("VFIO unsafe no-iommu mode parameter does not exist.")
+
   # 0x74b5 is Instinct MI300X VF
   gpus = System.pci_scan_bus(0x1002, [(0xffff, [0x74b5])])
   if not gpus:
@@ -12,16 +32,24 @@ if __name__ == "__main__":
     exit(0)
 
   for gpu in gpus:
-    print(f"========================================\nResetting VF GPU at {gpu}\n========================================")
+    print(f"\n========================================\nResetting VF GPU at {gpu}\n========================================")
     dev_path = f"/sys/bus/pci/devices/{gpu}"
     
+    # Print IOMMU Group Devices
+    iommu_path = f"{dev_path}/iommu_group/devices"
+    if os.path.exists(iommu_path):
+      print(f"IOMMU Group Devices for {gpu}: {os.listdir(iommu_path)}")
+    else:
+      print(f"No IOMMU Group found for {gpu} (Device might be using no-iommu).")
+
     # 1. Unbind from current driver if bound
     drv_path = f"{dev_path}/driver"
     if FileIOInterface.exists(drv_path):
       driver_name = os.path.basename(os.readlink(drv_path))
-      print(f"Current driver: {driver_name}. Unbinding...")
+      unbind_node = f"{drv_path}/unbind"
+      print(f"Unbinding {gpu} from current driver {driver_name} (writing to {unbind_node})...")
       try:
-        with open(f"{drv_path}/unbind", "w") as f:
+        with open(unbind_node, "w") as f:
           f.write(gpu)
         time.sleep(0.5)
       except Exception as e:
@@ -31,7 +59,7 @@ if __name__ == "__main__":
     reset_path = f"{dev_path}/reset"
     flr_success = False
     if FileIOInterface.exists(reset_path):
-      print("Triggering Function Level Reset (FLR)...")
+      print(f"Triggering Function Level Reset (FLR) (writing 1 to {reset_path})...")
       try:
         with open(reset_path, "w") as f:
           f.write("1")
@@ -48,7 +76,6 @@ if __name__ == "__main__":
       try:
         with open(config_path, "rb") as f:
           header = f.read(4)
-          # If it returns 0xffffffff or empty, config space is blocked
           if header and header != b'\xff\xff\xff\xff':
             config_responsive = True
       except Exception:
@@ -57,24 +84,22 @@ if __name__ == "__main__":
     if not flr_success or not config_responsive:
       print("Device is unresponsive or FLR failed. Triggering PCI bus remove & rescan...")
       
-      # Remove device from PCI bus
       remove_path = f"{dev_path}/remove"
       if FileIOInterface.exists(remove_path):
+        print(f"Removing device from PCI tree (writing 1 to {remove_path})...")
         try:
           with open(remove_path, "w") as f:
             f.write("1")
-          print(f"Removed {gpu} from PCI bus topology.")
           time.sleep(1.0)
         except Exception as e:
           print(f"Failed to remove device: {e}")
 
-      # Rescan PCI bus
       rescan_path = "/sys/bus/pci/rescan"
       if FileIOInterface.exists(rescan_path):
+        print(f"Rescanning PCI bus (writing 1 to {rescan_path})...")
         try:
           with open(rescan_path, "w") as f:
             f.write("1")
-          print("PCI bus rescan completed.")
           time.sleep(2.0)
         except Exception as e:
           print(f"Failed to trigger PCI bus rescan: {e}")
@@ -84,14 +109,15 @@ if __name__ == "__main__":
       print(f"Error: Device {gpu} did not reappear after reset/rescan!")
       continue
 
-    # If the device auto-bound to another driver after rescan, unbind it first
+    # Unbind from any auto-bound driver after rescan
     current_drv_link = f"{dev_path}/driver"
     if FileIOInterface.exists(current_drv_link):
       current_drv = os.path.basename(os.readlink(current_drv_link))
       if current_drv != "vfio-pci":
-        print(f"Device auto-bound to {current_drv} after rescan. Unbinding...")
+        unbind_node = f"{current_drv_link}/unbind"
+        print(f"Device auto-bound to {current_drv} after rescan. Unbinding from {current_drv} (writing to {unbind_node})...")
         try:
-          with open(f"{current_drv_link}/unbind", "w") as f:
+          with open(unbind_node, "w") as f:
             f.write(gpu)
           time.sleep(0.5)
         except Exception as e:
@@ -102,11 +128,10 @@ if __name__ == "__main__":
     if FileIOInterface.exists(vfio_bind_path):
       override_path = f"{dev_path}/driver_override"
       try:
-        # Clear any old driver overrides and write clean vfio-pci override
+        print(f"Writing 'vfio-pci' to {override_path}...")
         with open(override_path, "w") as f:
           f.write("vfio-pci")
         
-        # If already bound to vfio-pci, skip bind to avoid errors
         current_drv_link = f"{dev_path}/driver"
         is_already_bound = False
         if FileIOInterface.exists(current_drv_link):
@@ -114,6 +139,7 @@ if __name__ == "__main__":
             is_already_bound = True
 
         if not is_already_bound:
+          print(f"Binding {gpu} to vfio-pci by writing to {vfio_bind_path}...")
           with open(vfio_bind_path, "w") as f:
             f.write(gpu)
           time.sleep(0.5)
@@ -125,5 +151,8 @@ if __name__ == "__main__":
           print(f"Warning: Binding sent, but {gpu} is not bound to vfio-pci.")
       except Exception as e:
         print(f"Failed to bind to vfio-pci: {e}")
+        # Print dmesg log to help debug
+        print("\n--- Kernel logs (dmesg) regarding the failure ---")
+        run_cmd("dmesg | tail -n 25")
     else:
       print("Error: vfio-pci driver bind path not found. Is vfio-pci module loaded?")
