@@ -423,6 +423,7 @@ class AM_GFX(AM_IP):
         _config_helper(eng_name="MEC", cntl_reg="MEC_RS64", eng_reg="MEC_RS64", pipe_cnt=1, me=1, xcc=xcc)
 
   def _dequeue_hqds(self):
+    if self.adev.is_vf: return
     for q in range(2):
       for xcc in range(self.xccs):
         self._grbm_select(me=1, pipe=0, queue=q, inst=xcc)

@@ -499,7 +499,7 @@ class AMDDevice(HCQ2Compiled):
       debug_memory_size=round_up(self.wave_cnt * 32, 64))
 
   def sdma_queue(self, idx:int):
-    if getenv("AMD_DISABLE_SDMA"): return None
+    if getenv("AMD_DISABLE_SDMA") or (self.is_am() and self.iface.dev_impl.is_vf): return None
     if idx in self.sdma_queues: return self.sdma_queues[idx]
     with contextlib.suppress(OSError):
       self.sdma_queues[idx] = self.create_queue(kfd.KFD_IOC_QUEUE_TYPE_SDMA, 0x200 if self.is_usb() else (16 << 20), idx=idx)
