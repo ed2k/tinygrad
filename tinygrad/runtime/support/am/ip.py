@@ -28,6 +28,7 @@ class AM_SOC(AM_IP):
     self.ih_srcs_names:dict[int, dict[int, str]] = {**{k: gfx_srcs for k in self.gfx_ih_clients}, **{k: sdma_srcs for k in self.sdma_ih_clients}}
 
   def init_hw(self):
+    if self.adev.is_vf: return
     if self.adev.ip_ver[am.NBIO_HWIP] in {(7,9,0), (7,9,1)}:
       self.adev.regXCC_DOORBELL_FENCE.write(0x0)
       for aid in range(1, self.adev.gmc.vmhubs):
@@ -52,8 +53,12 @@ class AM_GMC(AM_IP):
     self.vmhubs = len(self.adev.regs_offset[am.MMHUB_HWIP])
 
     # XGMI (for supported systems)
-    self.xgmi_phys_id = self.adev.regMMMC_VM_XGMI_LFB_CNTL.read_bitfields()['pf_lfb_region'] if hasattr(self.adev, 'regMMMC_VM_XGMI_LFB_CNTL') else 0
-    self.xgmi_seg_sz = self.adev.regMMMC_VM_XGMI_LFB_SIZE.read_bitfields()['pf_lfb_size']<<24 if hasattr(self.adev, 'regMMMC_VM_XGMI_LFB_SIZE') else 0
+    if self.adev.is_vf:
+      self.xgmi_phys_id = 0
+      self.xgmi_seg_sz = 0
+    else:
+      self.xgmi_phys_id = self.adev.regMMMC_VM_XGMI_LFB_CNTL.read_bitfields()['pf_lfb_region'] if hasattr(self.adev, 'regMMMC_VM_XGMI_LFB_CNTL') else 0
+      self.xgmi_seg_sz = self.adev.regMMMC_VM_XGMI_LFB_SIZE.read_bitfields()['pf_lfb_size']<<24 if hasattr(self.adev, 'regMMMC_VM_XGMI_LFB_SIZE') else 0
 
     self.paddr_base = self.xgmi_phys_id * self.xgmi_seg_sz
 
@@ -76,7 +81,7 @@ class AM_GMC(AM_IP):
     self.dummy_page_xgmi_paddr = self.adev.paddr2xgmi(self.adev.mm.palloc(0x1000, zero=False, boot=True))
 
     # MM hub is inited before any tlb flushes and is still valid during partial_boot, so set it to true
-    self.hub_initted = {"MM": True, "GC": False}
+    self.hub_initted = {"MM": True, "GC": True if self.adev.is_vf else False}
 
     self.pf_status_reg = lambda ip: f"reg{ip}VM_L2_PROTECTION_FAULT_STATUS{'_LO32' if self.adev.ip_ver[am.GC_HWIP] >= (12,0,0) else ''}"
 
@@ -115,6 +120,12 @@ class AM_GMC(AM_IP):
       page_table_depth=((2 if self.trans_futher else 3) - page_table.lv), page_table_block_size=9 if self.trans_futher else 0, inst=inst)
 
   def init_hub(self, ip:Literal["MM", "GC"], inst_cnt:int):
+    if self.adev.is_vf:
+      for inst in range(inst_cnt):
+        self.enable_vm_addressing(self.adev.mm.root_page_table, ip, vmid=0, inst=inst)
+      self.hub_initted[ip] = True
+      return
+
     # Init system apertures
     for inst in range(inst_cnt):
       self.adev.reg(f"reg{ip}MC_VM_AGP_BASE").write(0, inst=inst)
@@ -173,10 +184,12 @@ class AM_GMC(AM_IP):
 
 class AM_SMU(AM_IP):
   def init_sw(self):
+    if self.adev.is_vf: return
     self.smu_mod = self.adev._ip_module("smu", am.MP1_HWIP)
     self.driver_table_paddr = self.adev.mm.palloc(0x4000, zero=False, boot=True)
 
   def init_hw(self):
+    if self.adev.is_vf: return
     self._send_msg(self.smu_mod.PPSMC_MSG_SetDriverDramAddrHigh, hi32(self.adev.paddr2mc(self.driver_table_paddr)))
     self._send_msg(self.smu_mod.PPSMC_MSG_SetDriverDramAddrLow, lo32(self.adev.paddr2mc(self.driver_table_paddr)))
     self._send_msg(self.smu_mod.PPSMC_MSG_EnableAllSmuFeatures, 0)
@@ -250,6 +263,19 @@ class AM_GFX(AM_IP):
     self.mqd_mc = [self.adev.paddr2mc(mqd_paddr) for mqd_paddr in self.mqd_paddr]
 
   def init_hw(self):
+    if self.adev.is_vf:
+      for xcc in range(self.xccs):
+        self.adev.gmc.enable_vm_addressing(self.adev.mm.root_page_table, "GC", vmid=0, inst=xcc)
+        self.adev.regGRBM_CNTL.update(read_timeout=0xff, inst=xcc)
+        for i in range(0, 16):
+          self._grbm_select(vmid=i, inst=xcc)
+          self.adev.regSH_MEM_CONFIG.write(**({'initial_inst_prefetch':3} if self.adev.ip_ver[am.GC_HWIP][0]>=10 else {'retry_disable':1}),
+            **({'f8_mode':1} if self.adev.ip_ver[am.GC_HWIP][:2]==(9,4) else {}),
+            address_mode=self.adev.soc.module.SH_MEM_ADDRESS_MODE_64, alignment_mode=self.adev.soc.module.SH_MEM_ALIGNMENT_MODE_UNALIGNED, inst=xcc)
+          self.adev.regSH_MEM_BASES.write(shared_base=0x1, private_base=0x2, inst=xcc)
+        self._grbm_select(inst=xcc)
+      return
+
     # Wait for RLC autoload to complete
     wait_cond(lambda: self.adev.regCP_STAT.read() == 0 or self.adev.regRLC_RLCS_BOOTLOAD_STATUS.read_bitfields()['bootload_complete'] == 0,
               value=True, msg="RLC autoload timeout")
@@ -303,6 +329,7 @@ class AM_GFX(AM_IP):
 
   def reset_mec(self):
     self._dequeue_hqds()
+    if self.adev.is_vf: return
 
     if self.adev.ip_ver[am.GC_HWIP] < (12,0,0): # gfx12+ uses mec_pipe0_reset
       for xcc in range(self.xccs): self.adev.regGRBM_SOFT_RESET.write(soft_reset_cp=1, soft_reset_cpc=1, inst=xcc)
@@ -426,7 +453,7 @@ class AM_IH(AM_IP):
 
       self.adev.reg(f"regIH_DOORBELL_RPTR{suf}").write(enable=0)
 
-    if self.adev.ip_ver[am.OSSSYS_HWIP] != (4,4,2):
+    if not self.adev.is_vf and self.adev.ip_ver[am.OSSSYS_HWIP] != (4,4,2):
       self.adev.regIH_STORM_CLIENT_LIST_CNTL.update(client18_is_storm_client=1)
       self.adev.regIH_INT_FLOOD_CNTL.update(flood_cntl_enable=1)
       self.adev.regIH_MSI_STORM_CTRL.update(delay=3)
@@ -480,23 +507,25 @@ class AM_IH(AM_IP):
 
     self.drain()
 
-    bif_intr = self.adev.regBIF_BX0_BIF_DOORBELL_INT_CNTL.read_bitfields()
-    athub_err, cntlr_err = bif_intr['ras_athub_err_event_interrupt_status'], bif_intr['ras_cntlr_interrupt_status']
-    if athub_err or cntlr_err:
-      print(f"am {self.adev.devfmt}: fatal hardware error detected: {'RAS_ATHUB_ERR_EVENT ' if athub_err else ''}{'RAS_CNTLR' if cntlr_err else ''}")
+    if not self.adev.is_vf:
+      bif_intr = self.adev.regBIF_BX0_BIF_DOORBELL_INT_CNTL.read_bitfields()
+      athub_err, cntlr_err = bif_intr['ras_athub_err_event_interrupt_status'], bif_intr['ras_cntlr_interrupt_status']
+      if athub_err or cntlr_err:
+        print(f"am {self.adev.devfmt}: fatal hardware error detected: {'RAS_ATHUB_ERR_EVENT ' if athub_err else ''}{'RAS_CNTLR' if cntlr_err else ''}")
 
-      acas = self.adev.smu._aca_read_banks(ue=True) + self.adev.smu._aca_read_banks(ue=False)
-      for regs in acas:
-        acatyp = 'Uncorrectable' if (regs[1] >> 61) & 1 and (regs[1] >> 57) & 1 else 'Correctable'
-        hwname = f'{self.adev.hwid_names.get((regs[5] >> 32) & 0xFFF, "")} ({(regs[5] >> 32) & 0xFFF:#03x})'
-        print(f"am {self.adev.devfmt}: {acatyp} ACA: {hwname} mcatype={(regs[5] >> 48) & 0xFFFF:#06x} regs=[{', '.join(f'{r:#x}' for r in regs)}]")
+        acas = self.adev.smu._aca_read_banks(ue=True) + self.adev.smu._aca_read_banks(ue=False)
+        for regs in acas:
+          acatyp = 'Uncorrectable' if (regs[1] >> 61) & 1 and (regs[1] >> 57) & 1 else 'Correctable'
+          hwname = f'{self.adev.hwid_names.get((regs[5] >> 32) & 0xFFF, "")} ({(regs[5] >> 32) & 0xFFF:#03x})'
+          print(f"am {self.adev.devfmt}: {acatyp} ACA: {hwname} mcatype={(regs[5] >> 48) & 0xFFFF:#06x} regs=[{', '.join(f'{r:#x}' for r in regs)}]")
 
-      self.adev.regBIF_BX0_BIF_DOORBELL_INT_CNTL.write(ras_cntlr_interrupt_clear=cntlr_err, ras_athub_err_event_interrupt_clear=athub_err)
-      self.adev.is_err_state = True
+        self.adev.regBIF_BX0_BIF_DOORBELL_INT_CNTL.write(ras_cntlr_interrupt_clear=cntlr_err, ras_athub_err_event_interrupt_clear=athub_err)
+        self.adev.is_err_state = True
 
 class AM_SDMA(AM_IP):
   def init_sw(self): self.sdma_reginst, self.sdma_name = [], "F32" if self.adev.ip_ver[am.SDMA0_HWIP] < (7,0,0) else "MCU"
   def init_hw(self):
+    if self.adev.is_vf: return
     for pipe_id in range(16 if self.adev.ip_ver[am.SDMA0_HWIP] < (5,0,0) else 1):
       pipe, inst = ("", pipe_id) if self.adev.ip_ver[am.SDMA0_HWIP] < (5,0,0) else (str(pipe_id), 0)
 
@@ -558,6 +587,7 @@ class AM_SDMA(AM_IP):
 class AM_PSP(AM_IP):
   def init_sw(self):
     self.reg_pref = "regMP0_SMN_C2PMSG" if self.adev.ip_ver[am.MP0_HWIP] < (14,0,0) else "regMPASP_SMN_C2PMSG"
+    if self.adev.is_vf: return
 
     if self.adev.devfmt.startswith("usb:"):
       self.msg1_view, paddrs = self.adev.pci_dev.alloc_sysmem(512 << 10)
@@ -579,6 +609,7 @@ class AM_PSP(AM_IP):
     self.tmr_paddr = self.adev.mm.palloc(self.max_tmr_size, align=am.PSP_TMR_ALIGNMENT, zero=False, boot=True) if not self.boot_time_tmr else 0
 
   def init_hw(self):
+    if self.adev.is_vf: return
     spl_key = am.PSP_FW_TYPE_PSP_SPL if self.adev.ip_ver[am.MP0_HWIP] >= (14,0,0) else am.PSP_FW_TYPE_PSP_KDB
     sos_components = [(am.PSP_FW_TYPE_PSP_KDB, am.PSP_BL__LOAD_KEY_DATABASE), (spl_key, am.PSP_BL__LOAD_TOS_SPL_TABLE),
       (am.PSP_FW_TYPE_PSP_SYS_DRV, am.PSP_BL__LOAD_SYSDRV), (am.PSP_FW_TYPE_PSP_SOC_DRV, am.PSP_BL__LOAD_SOCDRV),

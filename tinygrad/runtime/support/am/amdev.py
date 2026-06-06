@@ -24,6 +24,11 @@ class AMRegister(AMDReg):
 class AMFirmware:
   def __init__(self, adev):
     self.adev = adev
+    if adev.is_vf:
+      self.sos_fw = {}
+      self.descs = []
+      self.ucode_start = {}
+      return
     def fmt_ver(hwip): return '_'.join(map(str, adev.ip_ver[hwip]))
 
     # Load SOS firmware
@@ -149,6 +154,8 @@ class AMDev:
     self.pci_dev, self.devfmt = pci_dev, pci_dev.pcibus
     self.vram, self.doorbell64, self.mmio = self.pci_dev.map_bar(0), self.pci_dev.map_bar(2, fmt='Q'), self.pci_dev.map_bar(5, fmt='I')
 
+    self.is_vf = (self.pci_dev.read_config(pci.PCI_DEVICE_ID, 2) == 0x74b5)
+
     self._run_discovery()
     self._build_regs()
 
@@ -165,8 +172,8 @@ class AMDev:
     self.is_booting = True # During boot only boot memory can be allocated. This flag is to validate this.
     self.init_sw(smi_dev=False)
 
-    self.partial_boot = (self.reg("regSCRATCH_REG7").read() == AMDev.Version) and (getenv("AM_RESET", 0) != 1)
-    if self.partial_boot and (self.reg("regSCRATCH_REG6").read() != 0 or self.reg(self.gmc.pf_status_reg("GC")).read() != 0):
+    self.partial_boot = True if self.is_vf else ((self.reg("regSCRATCH_REG7").read() == AMDev.Version) and (getenv("AM_RESET", 0) != 1))
+    if not self.is_vf and self.partial_boot and (self.reg("regSCRATCH_REG6").read() != 0 or self.reg(self.gmc.pf_status_reg("GC")).read() != 0):
       if DEBUG >= 2: print(f"am {self.devfmt}: Malformed state. Issuing a full reset.")
       self.partial_boot = False
 
@@ -185,15 +192,17 @@ class AMDev:
     self.is_booting = False
 
     # Re-initialize main blocks
+    if self.is_vf: self.init_hw(self.gmc, self.ih)
     self.init_hw(self.gfx, self.sdma)
 
-    if (max_power:=getenv("AM_POWER_LIMIT", 0.0)) > 0:
-      self.smu.set_power_limit(max_power)
-      self.smu.set_clocks(level=None)
-    else: self.smu.set_clocks(level=-1) # last level, max perf.
-    for ip in [self.soc, self.gfx]: ip.set_clockgating_state()
-    self.reg("regSCRATCH_REG7").write(AMDev.Version)
-    self.reg("regSCRATCH_REG6").write(1) # set initialized state.
+    if not self.is_vf:
+      if (max_power:=getenv("AM_POWER_LIMIT", 0.0)) > 0:
+        self.smu.set_power_limit(max_power)
+        self.smu.set_clocks(level=None)
+      else: self.smu.set_clocks(level=-1) # last level, max perf.
+      for ip in [self.soc, self.gfx]: ip.set_clockgating_state()
+      self.reg("regSCRATCH_REG7").write(AMDev.Version)
+      self.reg("regSCRATCH_REG6").write(1) # set initialized state.
     if DEBUG >= 2: print(f"am {self.devfmt}: boot done")
 
   def init_sw(self, smi_dev=False):
@@ -225,9 +234,11 @@ class AMDev:
   def fini(self):
     if DEBUG >= 2: print(f"am {self.devfmt}: Finalizing")
     for ip in [self.sdma, self.gfx]: ip.fini_hw()
-    self.smu.set_clocks(level=0)
+    if not self.is_vf:
+      self.smu.set_clocks(level=0)
     self.ih.interrupt_handler()
-    self.reg("regSCRATCH_REG6").write(self.is_err_state) # set finalized state.
+    if not self.is_vf:
+      self.reg("regSCRATCH_REG6").write(self.is_err_state) # set finalized state.
 
   def recover(self, force=False) -> bool:
     if not force and not self.is_err_state: return False
