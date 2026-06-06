@@ -84,6 +84,19 @@ if __name__ == "__main__":
       print(f"Error: Device {gpu} did not reappear after reset/rescan!")
       continue
 
+    # If the device auto-bound to another driver after rescan, unbind it first
+    current_drv_link = f"{dev_path}/driver"
+    if FileIOInterface.exists(current_drv_link):
+      current_drv = os.path.basename(os.readlink(current_drv_link))
+      if current_drv != "vfio-pci":
+        print(f"Device auto-bound to {current_drv} after rescan. Unbinding...")
+        try:
+          with open(f"{current_drv_link}/unbind", "w") as f:
+            f.write(gpu)
+          time.sleep(0.5)
+        except Exception as e:
+          print(f"Failed to unbind from {current_drv}: {e}")
+
     # 5. Bind to vfio-pci
     vfio_bind_path = "/sys/bus/pci/drivers/vfio-pci/bind"
     if FileIOInterface.exists(vfio_bind_path):
