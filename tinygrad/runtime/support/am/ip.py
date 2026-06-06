@@ -1,6 +1,9 @@
 import ctypes, time, contextlib, functools
 from typing import Literal
-from tinygrad.helpers import to_mv, data64, lo32, hi32, DEBUG, wait_cond, pad_bytes, getbits
+from tinygrad.helpers import to_mv, data64, lo32, hi32, DEBUG, wait_cond, pad_bytes, getbits, getenv
+
+AM_DEBUG = getenv("AM_DEBUG", 0)
+
 from tinygrad.runtime.autogen.am import am
 from tinygrad.runtime.support.amd import import_soc
 from tinygrad.runtime.support.memory import AddrSpace
@@ -489,8 +492,9 @@ class AM_IH(AM_IP):
       src_name = self.adev.soc.ih_srcs_names.get(client, {}).get(src, '')
       if src_name in {"SDMA_TRAP", "CP_EOP_INTR"}: continue
 
-      print(f"am {self.adev.devfmt}: IH ({rptr:#x}/{wptr['offset']:#x}) client={self.adev.soc.ih_clients.get(client)} src={src_name}({src}) "
-            f"ring={ring_id} vmid={vmid}({vmid_type}) pasid={pasid} node={node} ctx=[{ctx[0]:#x}, {ctx[1]:#x}, {ctx[2]:#x}, {ctx[3]:#x}]")
+      if AM_DEBUG >= 2:
+        print(f"am {self.adev.devfmt}: IH ({rptr:#x}/{wptr['offset']:#x}) client={self.adev.soc.ih_clients.get(client)} src={src_name}({src}) "
+              f"ring={ring_id} vmid={vmid}({vmid_type}) pasid={pasid} node={node} ctx=[{ctx[0]:#x}, {ctx[1]:#x}, {ctx[2]:#x}, {ctx[3]:#x}]")
 
       if src_name == "SQ_INTERRUPT_ID":
         enc_type = getbits(ctx[1], 6, 7) if (is_soc21:=self.adev.ip_ver[am.GC_HWIP][0] >= 11) else getbits(ctx[0], 26, 27)
