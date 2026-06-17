@@ -146,6 +146,8 @@ load_store_folding = PatternMatcher([
    lambda cat,ld: UOp(Ops.VCAT, cat.dtype.base.vec(cat.dtype.vcount), tuple(ld.replace(dtype=x.dtype.base, src=(x,)+ld.src[1:]) for x in cat.src))),
   # put PTRCAT after STORE
   (UPat(Ops.STORE, src=(UPat(Ops.PTRCAT, name="cat"), UPat(name="data"))), cat_after_store),
+  # put CAST(PTRCAT) after STORE: unwrap the CAST and split into individual stores
+  (UPat(Ops.STORE, src=(UPat(Ops.CAST, src=UPat(Ops.PTRCAT, name="cat")), UPat(name="data"))), cat_after_store),
 ])
 
 # *** correct load/store ***
@@ -154,7 +156,9 @@ def split_load_store(ctx:Renderer|None, ls:UOp, idx:UOp):
   # this splits loads and stores into multiple chunks
 
   # if there's only one element to load/store, no splitting needed
-  if (sz:=ls.src[0].dtype.count) == 1: return None
+  # also check data width for stores where index is scalar but data is wide
+  data_count = ls.src[1].dtype.count if ls.op is Ops.STORE and len(ls.src) > 1 else 1
+  if (sz:=max(ls.src[0].dtype.count, data_count)) == 1: return None
   buf = idx.src[0]
 
   # determine fold lengths

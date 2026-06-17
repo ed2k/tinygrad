@@ -103,17 +103,31 @@ def amd_flash_attention(o:UOp, q:UOp, k:UOp, v:UOp) -> UOp:
   # -- softmax in registers with warp shuffles --
   S_reg = S_reg.after(S_reg.store(S_reg * SCALE))
 
-  # per-thread local row max over TN=4 elements, then warp reduce across 16 lanes
+  # per-thread local row max over TN=4 elements
   m_ij = UOp.placeholder((TM,), dtypes.float, slot=7, addrspace=AddrSpace.REG)
   m_ij = m_ij.after(m_ij.after(n_tile).store(m_ij.const_like(-math.inf)))
   rm2 = UOp.range(TN, 261, AxisType.REDUCE)
   m_ij = m_ij.after(m_ij.store(m_ij.after(rm2).maximum(S_reg[:, rm2])).end(rm2))
-  # warp reduce max (in-place)
+
+  # Broadcast m_ij from (TM,) to (TM,TN) using register loop BEFORE warp_reduce_max
+  # After warp_reduce_max, m_ij contains MAX UOps that break .reshape()
+  m_ij_bcast = UOp.placeholder((TM, TN), dtypes.float, slot=9, addrspace=AddrSpace.REG)
+  m_ij_bcast = m_ij_bcast.after(m_ij_bcast.store(m_ij_bcast.const_like(0)))
+  ri_bc = UOp.range(TM, 280, AxisType.LOOP)
+  rj_bc = UOp.range(TN, 281, AxisType.LOOP)
+  m_ij_bcast = m_ij_bcast.after(m_ij_bcast[ri_bc, rj_bc].store(m_ij[ri_bc]).end(ri_bc, rj_bc))
+
+  # warp reduce max across 16 lanes (makes m_ij graph complex)
   ri_w = UOp.range(TM, 270, AxisType.LOOP)
   m_ij = m_ij.after(m_ij[ri_w].store(warp_reduce_max(m_ij[ri_w], lane)).end(ri_w))
 
-  # compute P = exp(S - m_ij) in S_reg
-  S_reg = S_reg.after(S_reg.store(((S_reg - m_ij.reshape(TM, 1).expand(TM, TN)) * LOG2E).exp2()))
+  # Update bcast with warp-reduced m_ij using GEP (works unlike .reshape())
+  ri_bc2 = UOp.range(TM, 282, AxisType.LOOP)
+  rj_bc2 = UOp.range(TN, 283, AxisType.LOOP)
+  m_ij_bcast = m_ij_bcast.after(m_ij_bcast[ri_bc2, rj_bc2].store(m_ij[ri_bc2]).end(ri_bc2, rj_bc2))
+
+  # compute P = exp(S - m_ij) in S_reg using pre-computed broadcast
+  S_reg = S_reg.after(S_reg.store(((S_reg - m_ij_bcast) * LOG2E).exp2()))
 
   p_local = UOp.placeholder((TM,), dtypes.float, slot=8, addrspace=AddrSpace.REG)
   p_local = p_local.after(p_local.after(n_tile).store(p_local.const_like(0)))
@@ -169,7 +183,12 @@ def amd_flash_attention(o:UOp, q:UOp, k:UOp, v:UOp) -> UOp:
   m_i = m_i.after(n_tile_end)
 
   # normalize: acc /= l_i
-  acc = acc.after(acc.store(acc * (1 / l_i).reshape(TM, 1).expand(TM, TD)))
+  inv_l_i = UOp.placeholder((TM, TD), dtypes.float, slot=10, addrspace=AddrSpace.REG)
+  ri_n = UOp.range(TM, 350, AxisType.LOOP)
+  rj_n = UOp.range(TD, 351, AxisType.LOOP)
+  inv_l_i = inv_l_i.after(inv_l_i.store(inv_l_i.const_like(0)))
+  inv_l_i = inv_l_i.after(inv_l_i[ri_n, rj_n].store(1 / l_i[ri_n]).end(ri_n, rj_n))
+  acc = acc.after(acc.store(acc * inv_l_i))
 
   # store output
   o = o.reshape(WAVES_M, TM // WMMA_ACC, WMMA_ACC, LANES_PER_WAVE_M, WAVES_N, TD, LANES_PER_WAVE_N)
