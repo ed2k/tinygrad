@@ -46,9 +46,9 @@ class TestGraphRewriteConst(unittest.TestCase):
     v1 = UOp.const(dtypes.int.vec(3), (0,1,2))
     v2 = UOp.const(dtypes.int.vec(3), (2,1,0))
     ret = graph_rewrite(v1+v2, sym)
-    self.assertEqual(ret.op, Ops.CONST)
+    self.assertEqual(ret.op, Ops.STACK)
     self.assertEqual(ret.dtype, dtypes.int.vec(3))
-    self.assertEqual(ret.arg, 2)
+    self.assertEqual(const_values(ret), (2,2,2))
 
 def xfail_broken_const_wraparound(fn):
   fn = pytest.mark.xfail(reason="const folding does not properly implement modular arithmetic")(fn)
@@ -406,7 +406,7 @@ class TestUOpGraph(unittest.TestCase):
     vc = v+c2
     out = vc+c4
     uops = to_uops_list([out])
-    self.assertEqual(len(uops), 4)  # +1 for SINK
+    self.assertEqual(len(uops), 5)  # +1 for SINK, +1 for the PARAM shape STACK
     out = uops[-2]  # -2 to skip SINK
     self.assertEqual(out.op, Ops.ADD)
     self.assertEqual(out.src[1].op, Ops.CONST)

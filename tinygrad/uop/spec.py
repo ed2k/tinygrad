@@ -55,6 +55,10 @@ spec_shared = PatternMatcher([
   (UPat(Ops.CONST, src=(), name="x"), lambda x: type(x.arg) is type(x.dtype.const(x.arg))),
   (UPat(Ops.DEFINE_VAR, name="x"), lambda x: len(x.arg) == 3 and isinstance(x.arg[0], str)),
 
+  # STACK is everywhere too
+  (UPat(Ops.STACK, dtype=dtypes.void, src=()), lambda: True),
+  (UPat(Ops.STACK, src=(UPat(),), allow_any_len=True, name="s"), lambda s: all_same([x.shape for x in s.src])),
+
   # ALUs: most ALUs have all matching dtypes, except CMPLT, CMPNE, and WHERE
   (UPat(Ops.WHERE, name="w", src=(UPat(dtype=dtypes.bool), UPat.var("x"), UPat.var("y"))), lambda w,x,y: w.dtype == x.dtype == y.dtype),
   (UPat((Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ), dtype=dtypes.bool, src=(UPat.var("x"), UPat.var("y"))), lambda x,y: x.dtype.base == y.dtype.base),
@@ -80,7 +84,7 @@ spec_shared = PatternMatcher([
   # TODO: remove UNROLL here, it's for SPEC=2
   (UPat(Ops.GROUP, dtypes.void, src=UPat((Ops.GROUP, Ops.STORE, Ops.NOOP, Ops.UNROLL, Ops.INS))), lambda: True),
 
-  # TOOD: these should be buffer with different addrspace
+  # TOOD: these should be buffer with different addrspace everywhere.
   (UPat((Ops.DEFINE_LOCAL, Ops.DEFINE_REG)), lambda: True),
 
   # AFTER on Movement Op, PARAM, BUFFER, CONTIGUOUS, or another AFTER
@@ -146,12 +150,11 @@ spec_tensor = PatternMatcher([
   (UPat(Ops.GETTUPLE, src=(UPat((Ops.FUNCTION, Ops.TUPLE)),), name="g"), lambda g: isinstance(g.arg, int)),
 
   # inputs to movement ops
-  (UPat(Ops.STACK), lambda: True),
   (UPat({Ops.ADD, Ops.MUL, Ops.CDIV, Ops.FLOORDIV}, dtype=dtypes.weakint), lambda: True),
 
   # movement ops
-  (UPat((Ops.RESHAPE, Ops.EXPAND), src=(UPat(), UPat(dtype=dtypes.weakint))), lambda: True),
-  (UPat((Ops.PAD, Ops.SHRINK), src=(UPat(), UPat(dtype=dtypes.weakint), UPat(dtype=dtypes.weakint)), name="x"),
+  (UPat((Ops.RESHAPE, Ops.EXPAND), src=(UPat(), UPat())), lambda: True),
+  (UPat((Ops.PAD, Ops.SHRINK), src=(UPat(), UPat(), UPat()), name="x"),
    lambda x: x.src[1].dtype.count == x.src[2].dtype.count),
   (UPat((Ops.PERMUTE, Ops.FLIP), name="mv", src=(UPat(),)), lambda mv: isinstance(mv.arg, tuple)),
 
@@ -192,14 +195,20 @@ spec_tensor = PatternMatcher([
 
 # these ops can exist in programs but not the tensor spec. example: LOAD
 spec_program = PatternMatcher([
+  # no more of these in programs
+  (UPat((Ops.DEFINE_LOCAL, Ops.DEFINE_REG, Ops.DEFINE_VAR, Ops.GEP)), lambda: False),
+
   # weakint is not allowed in programs
   (UPat(GroupOp.All, dtypes.weakint), lambda: False),
 
   # allow special SHRINK
-  (UPat(Ops.SHRINK, src=(UPat((Ops.PARAM, Ops.DEFINE_LOCAL, Ops.DEFINE_REG, Ops.AFTER)), UPat(), UPat(Ops.CONST))), lambda: True),
+  (UPat(Ops.SHRINK, src=(UPat((Ops.PARAM, Ops.BUFFER, Ops.AFTER)), UPat(), UPat(Ops.CONST))), lambda: True),
 
   # movement ops are not allowed in programs
   (UPat(GroupOp.Movement), lambda: False),
+
+  # REG/LOCAL buffer
+  (UPat(Ops.BUFFER, name="x"), lambda x: isinstance(x.arg, ParamArg) and x.addrspace in (AddrSpace.REG, AddrSpace.LOCAL)),
 
   # Invalid is not allowed in program
   (UPat(Ops.CONST, arg=Invalid), lambda: False),
@@ -207,10 +216,6 @@ spec_program = PatternMatcher([
   # shape of uop must match dtype.count in program
   (UPat(GroupOp.All-{Ops.INS, Ops.NOOP}, name="x"),
    lambda x: False if x.dtype.count > 1 and (x.dtype.count,) != x.shape else None),
-
-  # STACK/GEP in program. TODO: this should match Tensor
-  (UPat(Ops.STACK, name="x"), lambda x: len(x.src)>1),
-  (UPat(Ops.GEP, src=(UPat.var("src"),), name="gep"), lambda gep,src: gep.dtype == src.dtype.scalar()),
 
   # if has a <gate, index_for_dedup>
   (UPat(Ops.IF, dtype=dtypes.void, src=(UPat(dtype=dtypes.bool), UPat((Ops.CAST, Ops.INDEX, Ops.SHRINK)))), lambda: True),
