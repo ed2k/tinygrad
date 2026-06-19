@@ -64,7 +64,7 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       qs_off = 48 if ggml_type == 13 else 16
       q = Tensor.stack((qs:=blocks[:,qs_off:qs_off+128].reshape(-1,4,32)).bitwise_and(0xF), qs.rshift(4), dim=2).reshape(-1,8,32)
       if ggml_type == 13: q = q + q_to_uint8(blocks[:,16:48], 1).reshape(-1, 8, 32) * 16
-      return (d * sc.unsqueeze(-1) * q - dmin * mn.unsqueeze(-1)).flatten(-2)
+      return (d * sc.unsqueeze(-1) * q - dmin * mn.unsqueeze(-1)).flatten(-2).cast(dtypes.float16)
     if ggml_type == 14:
       xl, xh = q_to_uint8(blocks[:,:128].reshape((-1, 2, 64)), 4), q_to_uint8(blocks[:,128:192].reshape((-1, 2, 32)), 2).lshift(4)
       scales = blocks[:,192:208].bitcast(dtypes.int8).unsqueeze(-1).expand((-1, 16, 16)).reshape((-1, 256))
@@ -146,8 +146,31 @@ def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   alignment, pos = kv_data.get("general.alignment", 32), r.tell()
   data_start = round_up(pos, alignment)
 
-  state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
-  return kv_data, state_dict
+  state_dict = {}
+  compressed_dict = {}
+  for name, dims, typ, off in t_infos:
+    if typ == 12:  # Q4_K - store raw blocks + pre-extract dequant components for fused GEMV
+      nelements_nbytes = _GGML_QUANT[12]
+      num_blocks = prod(dims) // nelements_nbytes[0]
+      raw_blocks = tensor[data_start + off:][:num_blocks * nelements_nbytes[1]].reshape((num_blocks, nelements_nbytes[1])).cast(dtypes.uint8)
+      orig_shape = tuple(reversed(dims))
+      N_rows = orig_shape[0]
+      B = num_blocks // N_rows
+      # Pre-extract dequant components (done once at load, not per-token)
+      d = raw_blocks[:,0:2].bitcast(dtypes.float16).cast(dtypes.float32)[:,0]
+      dmin = raw_blocks[:,2:4].bitcast(dtypes.float16).cast(dtypes.float32)[:,0]
+      s = raw_blocks[:,4:16]
+      sc = s[:,0:4].bitwise_and(63).cat(s[:,8:12].bitwise_and(0xF).bitwise_or(s[:,0:4].rshift(6).lshift(4)), dim=-1)
+      mn = s[:,4:8].bitwise_and(63).cat(s[:,8:12].rshift(4).bitwise_or(s[:,4:8].rshift(6).lshift(4)), dim=-1)
+      qs = raw_blocks[:,16:144].reshape(-1,4,32)
+      q = Tensor.stack(qs.bitwise_and(0xF), qs.rshift(4), dim=2).reshape(num_blocks, 8, 32)
+      compressed_dict[name] = (d.reshape(N_rows, B), dmin.reshape(N_rows, B), sc.reshape(N_rows, B, 8),
+                                mn.reshape(N_rows, B, 8), q.reshape(N_rows, B, 8, 32), orig_shape, raw_blocks)
+      # Dequant to float16 for model structure compatibility
+      state_dict[name] = ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims))
+    else:
+      state_dict[name] = ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims))
+  return kv_data, state_dict, compressed_dict
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if (total := kv.get('split.count', 1)) <= 1: return [path]
@@ -155,7 +178,22 @@ def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if not (m := re.match(r"^(.*)-00001-of-\d{5}\.gguf$", str(path))): raise ValueError(f"first split path must end with -00001-of-NNNNN.gguf: {path}")
   return [pathlib.Path(f"{m.group(1)}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total+1)]
 
-def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
+def q4k_dequant_inplace(blocks: Tensor, shape: tuple[int, ...]|None = None) -> Tensor:
+  """Dequant Q4_K blocks: (num_blocks, 144) -> float16 tensor.
+  If shape is provided, reshapes to original weight dimensions."""
+  N = blocks.shape[0]
+  d = blocks[:,0:2].bitcast(dtypes.float16).cast(dtypes.float32).unsqueeze(-1)
+  dmin = blocks[:,2:4].bitcast(dtypes.float16).cast(dtypes.float32).unsqueeze(-1)
+  s = blocks[:,4:16]
+  sc = s[:,0:4].bitwise_and(63).cat(s[:,8:12].bitwise_and(0xF).bitwise_or(s[:,0:4].rshift(6).lshift(4)), dim=-1)
+  mn = s[:,4:8].bitwise_and(63).cat(s[:,8:12].rshift(4).bitwise_or(s[:,4:8].rshift(6).lshift(4)), dim=-1)
+  qs = blocks[:,16:144].reshape(-1,4,32)
+  q = Tensor.stack(qs.bitwise_and(0xF), qs.rshift(4), dim=2).reshape(-1,8,32)
+  out = (d * sc.unsqueeze(-1) * q - dmin * mn.unsqueeze(-1)).flatten(-2).cast(dtypes.float16)
+  if shape is not None: return out.reshape(shape)
+  return out.reshape(N, -1)
+
+def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor], dict[str, Tensor]]:
   """
   Loads a .gguf file, returning the `kv_data` and `state_dict`. Multi-part splits are auto-merged when loaded by path.
 
@@ -165,13 +203,16 @@ def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
   from tinygrad.llm.gguf import gguf_load
 
   gguf_tensor = Tensor(pathlib.Path("Meta-Llama-3-8B-Instruct.Q4_0.gguf")).to(Device.DEFAULT)
-  kv_data, state_dict = gguf_load(gguf_tensor)
+  kv_data, state_dict, _ = gguf_load(gguf_tensor)
   ```
 
   NOTE: The provided tensor must be on a device that supports execution.
   """
-  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)))
-  if kv.get('split.count', 1) <= 1: return kv, sd
+  kv, sd, compressed = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)))
+  if kv.get('split.count', 1) <= 1: return kv, sd, compressed
   if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
-  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp))[1])
-  return kv, sd
+  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]:
+    kv2, sd2, comp2 = _gguf_parse(Tensor(pp))
+    sd.update(sd2)
+    compressed.update(comp2)
+  return kv, sd, compressed

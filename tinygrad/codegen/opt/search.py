@@ -22,6 +22,12 @@ actions += [Opt(op=OptOps.TC, axis=0, arg=(-1, 0, getenv("TC", 1)))]
 actions += [Opt(op=OptOps.TC, axis=axis, arg=(-1, getenv("TC_OPT", 2), getenv("TC", 1))) for axis in range(9)]
 actions += [Opt(op=OptOps.SWAP, axis=axis_0, arg=axis_1) for axis_0 in range(5) for axis_1 in range(axis_0+1, 5)]
 actions += [Opt(op=OptOps.THREAD, axis=axis, arg=amt) for amt in [2,3,4,5,8,12,16,24,32,64] for axis in range(3)]
+# MI300X (gfx942): 256 CUs, wave32, 64KB LDS - add larger local sizes for better CU saturation
+actions += [Opt(op=OptOps.LOCAL, axis=axis, arg=amt) for amt in [64, 128, 256] for axis in range(3)]
+# MI300X: larger GROUPTOP sizes for wave32 alignment and LDS utilization
+actions += [Opt(op=OptOps.GROUPTOP, axis=axis, arg=amt) for amt in [32, 64, 128] for axis in range(3)]
+# MI300X: more UPCAST amounts for better vectorization
+actions += [Opt(op=OptOps.UPCAST, axis=axis, arg=amt) for amt in [8] for axis in range(8)]
 if getenv("NOLOCALS"): actions += [Opt(op=OptOps.NOLOCALS)]
 
 def get_test_global_size(global_size, max_global_size, var_vals):

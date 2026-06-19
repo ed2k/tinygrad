@@ -70,6 +70,7 @@ def compile_hip(prg:str, arch="gfx1100", asm=False) -> bytes:
     check(comgr.amd_comgr_set_data_name(data_src, b"<null>"))
     check(comgr.amd_comgr_data_set_add(data_set_src, data_src))
     # -include hiprtc_runtime.h was removed
+    is_cdna3 = arch.startswith("gfx94") or arch.startswith("gfx95")
     options = [
       "-O3", "-mcumode", "--hip-version=6.0.32830", "-DHIP_VERSION_MAJOR=6", "-DHIP_VERSION_MINOR=0", "-DHIP_VERSION_PATCH=32830",
       "-D__HIPCC_RTC__", "-std=c++14", "-nogpuinc", "-Wno-gnu-line-marker", "-Wno-missing-prototypes", f"--offload-arch={arch}",
@@ -79,7 +80,12 @@ def compile_hip(prg:str, arch="gfx1100", asm=False) -> bytes:
     if status != 0:
       print(_get_comgr_data(data_set_bc, comgr.AMD_COMGR_DATA_KIND_LOG).decode())
       raise RuntimeError("compile failed")
-    check(set_options(action_info, b"-O3 -mllvm -amdgpu-internalize-symbols"))
+    # CDNA3/4 (MI300X/MI350X): enable aggressive optimizations for better GEMM performance
+    codegen_opts = b"-O3 -mllvm -amdgpu-internalize-symbols"
+    if is_cdna3:
+      codegen_opts += b" -mllvm -amdgpu-unroll-threshold-if=4096 -mllvm -amdgpu-sched-strategy=2"
+      codegen_opts += b" -mllvm -amdgpu-limit-wave-threshold=4"
+    check(set_options(action_info, codegen_opts))
     check(comgr.amd_comgr_do_action(comgr.AMD_COMGR_ACTION_CODEGEN_BC_TO_RELOCATABLE, action_info, data_set_bc, data_set_reloc))
 
   check(set_options(action_info, b""))

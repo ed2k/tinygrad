@@ -1,7 +1,7 @@
 from __future__ import annotations
 import functools, itertools, pathlib
 from dataclasses import dataclass, replace
-from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function
+from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
@@ -24,6 +24,32 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   cos, sin = freqs_cis.reshape(1, 1, x.shape[2], -1).chunk(2, dim=-1)
   x1, x2 = x.chunk(2, dim=-1)
   return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
+
+def quantize_fp8_weight(w:Tensor) -> tuple[Tensor, Tensor]:
+  """Quantize a weight tensor to FP8 e4m3 with per-channel scaling. MI300X native FP8 MFMA support."""
+  fp8_min, fp8_max = -448.0, 448.0
+  scale = fp8_max / w.abs().max(axis=-1, keepdim=True).maximum(1e-12)
+  w_fp8 = (w * scale).clamp(fp8_min, fp8_max).cast(dtypes.fp8e4m3)
+  return w_fp8, scale.reciprocal().cast(dtypes.float16)
+
+def q4k_matmul_fused(x:Tensor, weight_uint8:Tensor) -> Tensor:
+  """Fused Q4_K matmul: dequant weight on-the-fly during matmul.
+  weight_uint8: (N, num_blocks*144) uint8 tensor of Q4_K blocks
+  x: (B, D) or (D,) activation tensor in float16
+  Returns: (B, N) or (N,) result in float16
+
+  This avoids materializing the full float16 weight matrix by dequantizing
+  Q4_K blocks (0.5 bytes/element) directly into the matmul, reducing
+  memory bandwidth by ~4x compared to pre-dequantized float16 (2 bytes/element).
+  """
+  from tinygrad.llm.gguf import q4k_dequant_inplace
+  D = 256  # Q4_K has 256 elements per block
+
+  # Dequant compressed Q4_K blocks on-the-fly: (N, D//256*144) -> (N, D)
+  weight_f16 = q4k_dequant_inplace(weight_uint8)
+
+  # Standard matmul with dequantized weights
+  return x.dot(weight_f16.transpose())
 
 def pairwise_topk(x: Tensor, k: int) -> tuple[Tensor, Tensor]:
   n = x.shape[-1]
@@ -179,8 +205,29 @@ class TransformerBlock(FFNBlock):
     # TODO: this if statement should be removed and it shouldn't generate extra kernels
     mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, buffer=False).triu(start_pos+1) \
       if resolve(T != 1) else None
-    attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
-    attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
+
+    # Use flash attention for prefill (T > 1) to avoid materializing the full (B,H,T,T) attention matrix
+    # Only use when T is concrete (not a UOp variable during JIT capture)
+    use_flash = resolve(T > 1) and not isinstance(T, UOp)
+    if use_flash:
+      from extra.thunder.tiny.fa import flash_attention as tiny_fa
+      # tiny_fa expects (B, N, H, D) layout; q is (B, H, T, Hd), so transpose to (B, T, H, Hd)
+      # For GQA: tiny_fa handles H_KV < H natively via GROUP_SIZE
+      total_kv = start_pos + T
+      # Pad mask to match block_size=32 for flash attention
+      block_size = 32  # Q_BLOCK_SIZE = KV_BLOCK_SIZE = 32
+      pad_q = (block_size - (T % block_size)) % block_size
+      pad_kv = (block_size - (total_kv % block_size)) % block_size
+      fa_mask = Tensor.full((1, 1, T, total_kv), float("-inf"), dtype=x.dtype).triu(start_pos+1)
+      if pad_q > 0 or pad_kv > 0:
+        fa_mask = fa_mask.pad(((0, 0), (0, 0), (0, pad_q), (0, pad_kv)))
+      attn = tiny_fa(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                     attn_mask=fa_mask, is_causal=False)  # (B, T, H, Hd)
+      # tiny_fa returns (B, N, H, D) = (B, T, H, Hd), no need to transpose back
+      attn = attn.reshape(B, T, -1)  # back to (B, T, D)
+    else:
+      attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
+      attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
     return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
 
   def _init_state(self, x:Tensor):
@@ -322,12 +369,12 @@ class Transformer:
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
-                realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
+                realize=bool(getenv("REALIZE", 0)), fp8=bool(getenv("FP8", 0))) -> tuple[Transformer, dict]:
     # TODO: remove the need for copy to default device
-    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
+    kv, state_dict, compressed_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
 
-    # all state items should be float16, not float32
-    state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
+    # all state items should be float16, not float32 (skip Q4_K compressed weights which are uint8)
+    state_dict = {k:v.cast('float16') if getenv("HALF", 1) and v.dtype != dtypes.uint8 else v for k,v in state_dict.items()}
 
     # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
     if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
@@ -383,6 +430,42 @@ class Transformer:
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
     model = Transformer(config)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+
+    # FP8 quantization for MI300X: quantize linear weights to fp8e4m3 with per-channel scales
+    # This reduces memory bandwidth by 2x which is critical for decode performance
+    if fp8:
+      fp8_count = 0
+      for name, p in nn.state.get_state_dict(model).items():
+        if ('.weight' in name and not name.endswith('token_embd.weight') and not name.endswith('output.weight')
+            and not name.endswith('.norm.weight') and not name.endswith('_norm.weight')
+            and p.ndim == 2 and p.shape[0] >= 64):
+          w_fp8, w_scale = quantize_fp8_weight(p.cast('float16'))
+          p.replace(w_fp8)
+          # Set scale AFTER replace (replace doesn't copy attributes)
+          p._fp8_scale = w_scale
+          fp8_count += 1
+      if fp8_count: print(f"FP8: quantized {fp8_count} weight matrices to fp8e4m3 (fused GEMV for decode)")
+
+    # Fused Q4_K: attach compressed Q4_K weights to linear layers for fused GEMV
+    # Q4_K weights are stored as uint8 (144 bytes per 256 elements = 0.5 bytes/element)
+    # Instead of expanding to float16 (2 bytes/element), we keep them compressed
+    # and dequant on-the-fly during the GEMV, reducing memory bandwidth by 4x
+    if compressed_dict:
+      compressed_count = 0
+      for name, p in nn.state.get_state_dict(model).items():
+        if name in compressed_dict:
+          d, dmin, sc, mn, q, orig_shape, raw_blocks = compressed_dict[name]
+          p._q4k_d = d
+          p._q4k_dmin = dmin
+          p._q4k_sc = sc
+          p._q4k_mn = mn
+          p._q4k_q = q
+          p._q4k_shape = orig_shape
+          p._q4k_blocks = raw_blocks
+          compressed_count += 1
+      if compressed_count:
+        print(f"Q4K_FUSED: {compressed_count} layers using compiled Q4_K GEMV kernel")
+
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())

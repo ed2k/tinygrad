@@ -174,7 +174,38 @@ class Linear:
     self.weight = Tensor.uniform(out_features, in_features, low=-bound, high=bound)
     self.bias = Tensor.uniform(out_features, low=-bound, high=bound) if bias else None
 
-  def __call__(self, x:Tensor) -> Tensor: return x.linear(self.weight.transpose(), self.bias)
+  def __call__(self, x:Tensor) -> Tensor:
+    # Q4_K fused path: detect pre-extracted Q4_K components
+    q4k_d = getattr(self.weight, '_q4k_d', None)
+    if q4k_d is not None:
+      if x.ndim == 1 or (x.ndim == 2 and x.shape[0] == 1):
+        # Decode: use compiled HIP kernel for Q4_K GEMV
+        from tinygrad.llm.q4k_fused import q4k_gemv_compiled
+        x_flat = x.reshape(-1) if x.ndim > 1 else x
+        y = q4k_gemv_compiled(x_flat, self.weight._q4k_blocks, self.weight._q4k_shape)
+        if self.bias is not None: y = y + self.bias
+        return y.reshape(1, -1) if x.ndim == 2 else y
+      # Prefill: use pre-extracted components
+      from tinygrad.llm.q4k_fused import q4k_dequant_preextracted
+      w = q4k_dequant_preextracted(q4k_d, self.weight._q4k_dmin,
+                                   self.weight._q4k_sc, self.weight._q4k_mn,
+                                   self.weight._q4k_q, self.weight._q4k_shape)
+      return x.linear(w.transpose(), self.bias)
+    # FP8 fused GEMV path: read FP8 weights and dequant on-the-fly during matmul
+    fp8_scale = getattr(self.weight, '_fp8_scale', None)
+    if fp8_scale is not None:
+      from extra.gemm.fp8_gemm import fp8_gemv
+      # For GEMV (T=1): x is (1, K) or (K,), w_fp8 is (N, K), w_scale is (N,)
+      # The fused kernel reads FP8 weights (1 byte/element) and dequants during matmul
+      if x.ndim == 1 or (x.ndim == 2 and x.shape[0] == 1):
+        x_flat = x.reshape(-1) if x.ndim > 1 else x
+        y = fp8_gemv(x_flat, self.weight, fp8_scale)
+        if self.bias is not None: y = y + self.bias
+        return y.reshape(1, -1) if x.ndim == 2 else y
+      # For GEMM (T>1): fall back to dequant-then-matmul
+      w = self.weight.cast(dtypes.float16) * fp8_scale
+      return x.linear(w.transpose(), self.bias)
+    return x.linear(self.weight.transpose(), self.bias)
 
 class GroupNorm:
   """

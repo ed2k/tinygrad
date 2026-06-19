@@ -5,6 +5,13 @@ from tinygrad.dtype import PtrDType, ImageDType
 from tinygrad.uop.ops import Ops, resolve, AxisType
 from tinygrad.codegen.opt.postrange import Scheduler
 
+def _is_cdna3_or_4(k:Scheduler) -> bool:
+  arch = k.ren.target.arch.split(":")[0]
+  return arch in ("gfx942", "gfx950")
+
+def _is_cdna3(k:Scheduler) -> bool:
+  return k.ren.target.arch.split(":")[0] == "gfx942"
+
 def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # first try the tensor cores
   """ Attempts to apply a tensor core optimization to the kernel. If one exists and applies properly, return true, otherwise return false.
@@ -40,8 +47,15 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
           if szs:
             # set it to the replaced range
             rngs[tc_dim] = tk.apply_opt(Opt(OptOps.UPCAST, tk.rngs.index(rngs[tc_dim]), szs[0]))[0]
-        if (szs := [sz for sz in [4,2] if rngs[0].src[0].divides(sz) is not None]): # attempt to local N
-          tk.apply_opt(Opt(OptOps.LOCAL, tk.rngs.index(rngs[0]), szs[0]))
+        if _is_cdna3_or_4(tk):
+          # MI300X (gfx942): 256 CUs, wave32, 64KB LDS - larger locals for better CU occupancy
+          # MI350X (gfx950): similar architecture with improved tensor cores
+          local_szs = [16, 8, 4, 2] if _is_cdna3(tk) else [8, 4, 2]
+          if (szs := [sz for sz in local_szs if rngs[0].src[0].divides(sz) is not None]):
+            tk.apply_opt(Opt(OptOps.LOCAL, tk.rngs.index(rngs[0]), szs[0]))
+        else:
+          if (szs := [sz for sz in [4,2] if rngs[0].src[0].divides(sz) is not None]): # attempt to local N
+            tk.apply_opt(Opt(OptOps.LOCAL, tk.rngs.index(rngs[0]), szs[0]))
       return tk
 
   # make a copy so it does not mutate the input
@@ -61,7 +75,11 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
             k.apply_opt(Opt(OptOps.UNROLL, k.unrollable_dims.index(axis), 4))
 
   # should use matvec - TODO: adjust/tune based on the wide vs tall/large vs small mat
-  MV_BLOCKSIZE, MV_THREADS_PER_ROW, MV_ROWS_PER_THREAD = getenv("MV_BLOCKSIZE", 4), getenv("MV_THREADS_PER_ROW", 8), getenv("MV_ROWS_PER_THREAD", 4)
+  # MI300X (gfx942): use larger block sizes and more threads to saturate 5.3 TB/s HBM3 bandwidth
+  if _is_cdna3_or_4(k):
+    MV_BLOCKSIZE, MV_THREADS_PER_ROW, MV_ROWS_PER_THREAD = getenv("MV_BLOCKSIZE", 8), getenv("MV_THREADS_PER_ROW", 16), getenv("MV_ROWS_PER_THREAD", 8)
+  else:
+    MV_BLOCKSIZE, MV_THREADS_PER_ROW, MV_ROWS_PER_THREAD = getenv("MV_BLOCKSIZE", 4), getenv("MV_THREADS_PER_ROW", 8), getenv("MV_ROWS_PER_THREAD", 4)
   if k.ren.has_local and getenv("MV",1) != 0 and (MV_BLOCKSIZE > 1 or MV_THREADS_PER_ROW > 1 or MV_ROWS_PER_THREAD > 1) and  \
     k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and len(k.full_shape) >= 2 and k.ren.has_shared and \
     (mulop:=k.reduceop.src[0]).op is Ops.MUL and mulop.src[0].op is Ops.INDEX and mulop.src[1].op is Ops.INDEX:
@@ -81,8 +99,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
             return k
 
   # are we grouping? (requires local shape support)
-  if resolve(prod(k.output_shape[i] for i in k.upcastable_dims) <= (240 if NOLOCALS else 2048), False):
-    for axis, sz in itertools.product((0, 1, 2), (16,)):
+  # MI300X (gfx942): 256 CUs with 64KB LDS each - can handle larger groups
+  group_threshold = 4096 if _is_cdna3_or_4(k) else (240 if NOLOCALS else 2048)
+  if resolve(prod(k.output_shape[i] for i in k.upcastable_dims) <= group_threshold, False):
+    for axis, sz in itertools.product((0, 1, 2), ([32, 16] if _is_cdna3_or_4(k) else [16])):
       try:
         k.apply_opt(Opt(OptOps.GROUPTOP, axis, sz))
         break
@@ -110,8 +130,10 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   upcasted_axis: set[int] = set()
   while resolve(prod(k.output_shape[i] for i in k.upcastable_dims) >= 1024) and (k.upcast_size() < 32):
     xb_choices = []
+    # MI300X (gfx942): prefer larger upcasts for better vectorization on wave32
+    upcast_amounts = [4, 8] if _is_cdna3(k) else ([128] if not len(upcasted_axis) else []) if is_dsp else [3,4]
     # consider all upcastable axes with 3 or 4 upcast (128 on the DSP)
-    for axis, upcast_amount in itertools.product(k.upcastable_dims, ([128] if not len(upcasted_axis) else []) if is_dsp else [3,4]):
+    for axis, upcast_amount in itertools.product(k.upcastable_dims, upcast_amounts):
       # if we haven't upcasted it, it mods, and buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
       if axis in upcasted_axis or k.full_shape[axis]%upcast_amount != 0: continue
       rng = k.rngs[axis]
@@ -137,7 +159,9 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # NOTE: this can fail on multireduce with mismatching dimensions, this is okay
   try:
     if k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64):
-      if (s:=k.full_shape[k.unrollable_dims[-1]]) <= 32:
+      # MI300X (gfx942): larger register file allows more aggressive unrolling
+      unroll_limit = 64 if _is_cdna3(k) else 32
+      if (s:=k.full_shape[k.unrollable_dims[-1]]) <= unroll_limit:
         k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
         # if it's small, upcast a second reduce dimension too
         if k.unrollable_dims and s <= 3 and k.full_shape[k.unrollable_dims[-1]] <= 3:
@@ -160,13 +184,17 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     if NOLOCALS:
       k.apply_opt(Opt(OptOps.NOLOCALS))
     else:
+      # MI300X (gfx942): 256 CUs, wave32, 64KB LDS per CU - allow larger workgroups for better CU utilization
+      max_local = 256 if _is_cdna3_or_4(k) else 128
       # prioritize making expand axes local
       local_axis_ranking = [(any(k.rngs[axis] not in b.src[1].get_idx().backward_slice for b in k.bufs), axis) \
                               for axis in k.axes_of(AxisType.GLOBAL, AxisType.LOOP) if k.rngs[axis].src[0].op is Ops.CONST]
       to_local: list[tuple[int, int]] = []
       for _, axis in sorted(local_axis_ranking, key=lambda x: (-x[0], -x[1])):
         local_size = prod(sz for _, sz in to_local)
-        local_sz: int|None = next((x for x in ([32] * (axis == 0) + [16,8,4,3,2]) if k.full_shape[axis] % x == 0 and local_size * x <= 128), None)
+        # MI300X (gfx942): prefer larger local sizes (wave32) for better occupancy
+        local_candidates = [32, 16, 8, 4, 3, 2] if _is_cdna3_or_4(k) and axis == 0 else ([32] * (axis == 0) + [16,8,4,3,2])
+        local_sz: int|None = next((x for x in local_candidates if k.full_shape[axis] % x == 0 and local_size * x <= max_local), None)
         if local_sz is not None: to_local.append((axis, local_sz))
       deleted_shape = 0
       for axis, local_sz in sorted(to_local[:3]):
